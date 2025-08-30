@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+
+# Banco de dados local
+clientes.db
+
+# Ambiente virtual
+venv/
+.env
+
+# Logs
+*.log
+
+# Configuração local
+*.env.local
