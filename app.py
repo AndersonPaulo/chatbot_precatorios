@@ -1,71 +1,91 @@
 import os
-import sqlite3
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, send_file
-from twilio.rest import Client
-from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask, request, jsonify
+from supabase import create_client, Client as SupabaseClient
+from twilio.rest import Client as TwilioClient
+from dotenv import load_dotenv
+from datetime import datetime
+
+# Carrega as variáveis de ambiente do arquivo .env
+load_dotenv()
 
 app = Flask(__name__)
 
 # ===============================
-# 🔹 Banco de dados
+# 🔹 Configurações dos Clientes
 # ===============================
-DB_PATH = "clientes.db"
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS clientes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            numero TEXT UNIQUE,
-            nome TEXT,
-            status TEXT,
-            termo_enviado_em TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# ===============================
-# 🔹 Twilio Config
-# ===============================
+# --- Twilio Config ---
 account_sid = os.getenv("TWILIO_ACCOUNT_SID")
 auth_token = os.getenv("TWILIO_AUTH_TOKEN")
 from_number = os.getenv("TWILIO_WHATSAPP_NUMBER")
-template_sid = os.getenv("TWILIO_TEMPLATE_SID")
-client = Client(account_sid, auth_token)
+template_sid = os.getenv("TWILIO_TEMPLATE_SID") # Essencial para o disparo inicial
 
-# Intervalo do .env
-REMINDER_INTERVAL = int(os.getenv("REMINDER_INTERVAL", "64800"))
+if not all([account_sid, auth_token, from_number, template_sid]):
+    print("❌ ERRO: Verifique as variáveis TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER e TWILIO_TEMPLATE_SID no .env.")
+    exit()
+twilio_client = TwilioClient(account_sid, auth_token)
+print("✅ Cliente Twilio inicializado.")
+
+# --- Supabase Config ---
+supabase_url: str = os.getenv("SUPABASE_URL")
+supabase_key: str = os.getenv("SUPABASE_KEY")
+
+if not all([supabase_url, supabase_key]):
+    print("❌ ERRO: Verifique as variáveis SUPABASE_URL e SUPABASE_KEY no .env.")
+    exit()
+supabase: SupabaseClient = create_client(supabase_url, supabase_key)
+print("✅ Cliente Supabase inicializado.")
+
 
 # ===============================
-# 🔹 Utilitário para enviar mensagens
+# 🔹 Funções Utilitárias
 # ===============================
+
 def enviar_whatsapp(to, body):
-    msg = client.messages.create(
-        from_=from_number,
-        to=to,
-        body=body
-    )
-    print(f"✅ Twilio OK: {msg.sid}")
-    return msg.sid
+    """Envia uma mensagem de texto simples via WhatsApp."""
+    try:
+        msg = twilio_client.messages.create(from_=from_number, to=to, body=body)
+        print(f"✅ Mensagem de texto enviada para {to}: {msg.sid}")
+        return msg.sid
+    except Exception as e:
+        print(f"❌ Erro ao enviar WhatsApp para {to}: {e}")
+        return None
+
+def disparar_e_registrar_contato_inicial(numero, nome):
+    """Dispara o template inicial da Twilio e cria/atualiza o contato no Supabase."""
+    try:
+        # 1. Cria ou atualiza o contato no Supabase
+        contact_data = {
+            'phone': numero,
+            'name': nome,
+            'status': 'inicial',
+            'automationStatus': 'Ativa'
+        }
+        # A função upsert irá inserir ou atualizar se o telefone já existir
+        response = supabase.table('WhatsAppContacts').upsert(contact_data, on_conflict='phone').execute()
+        
+        if not response.data:
+            raise Exception(f"Falha ao salvar contato no Supabase: {response.error}")
+        
+        # 2. Dispara o template da Twilio
+        msg = twilio_client.messages.create(
+            from_=from_number,
+            to=numero,
+            content_sid=template_sid,
+            content_variables=f'{{"1":"{nome}"}}'
+        )
+        print(f"✅ Template inicial disparado para {numero}: {msg.sid}")
+        return {"status": "sucesso", "sid": msg.sid}
+
+    except Exception as e:
+        print(f"❌ Erro no processo de disparo inicial para {numero}: {e}")
+        return {"status": "erro", "mensagem": str(e)}
 
 # ===============================
-# 🔹 Rota para servir o termo
-# ===============================
-@app.route("/static/termo")
-def termo():
-    # Corrigido para o nome certo do arquivo
-    return send_file("Termo_cedente.docx", as_attachment=True)
-
-# ===============================
-# 🔹 Endpoint para disparar mensagem inicial (via template Twilio)
+# 🔹 Endpoint para Disparo Inicial
 # ===============================
 @app.route("/api/disparar_template", methods=["POST"])
-def disparar_template():
+def api_disparar_template():
     data = request.json
     to_number = data.get("numero")
     nome = data.get("nome", "Cliente")
@@ -73,32 +93,16 @@ def disparar_template():
     if not to_number:
         return jsonify({"status": "erro", "mensagem": "Número de telefone ausente."}), 400
 
-    # 🛠️ Correção: Garante que o número seja salvo com o prefixo
+    # Garante que o número está no formato correto para a Twilio
     if not to_number.startswith("whatsapp:"):
-        to_number_db = "whatsapp:" + to_number
+        to_number = "whatsapp:" + to_number
+    
+    resultado = disparar_e_registrar_contato_inicial(to_number, nome)
+    
+    if resultado["status"] == "sucesso":
+        return jsonify(resultado)
     else:
-        to_number_db = to_number
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO clientes (numero, nome, status) VALUES (?, ?, ?)",
-              (to_number_db, nome, "inicial"))
-    conn.commit()
-    conn.close()
-
-    # Dispara TEMPLATE cadastrado no Twilio
-    try:
-        msg = client.messages.create(
-            from_=from_number,
-            to=to_number_db, # 🛠️ Correção: Usa o número já formatado para o envio
-            content_sid=template_sid,
-            content_variables=f'{{"1":"{nome}"}}'
-        )
-        print(f"✅ Template disparado: {msg.sid}")
-        return jsonify({"status": "sucesso", "sid": msg.sid})
-    except Exception as e:
-        print(f"❌ Erro ao enviar template: {e}")
-        return jsonify({"status": "erro", "mensagem": str(e)}), 500
+        return jsonify(resultado), 500
 
 # ===============================
 # 🔹 Webhook (respostas do cliente)
@@ -108,81 +112,120 @@ def webhook():
     data = request.form.to_dict()
     print(f"📩 Webhook recebido: {data}")
 
-    # 🛠️ Correção: Agora o número do webhook já está no formato correto para a busca
     from_number_user = data.get("From")
     profile_name = data.get("ProfileName", "Cliente")
     body = data.get("Body", "").strip().lower()
+    original_body = data.get("Body", "").strip()
+    message_sid = data.get("MessageSid") # Captura o ID da mensagem da Twilio
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # 🛠️ Correção: A query agora busca o número com o prefixo
-    c.execute("SELECT status FROM clientes WHERE numero = ?", (from_number_user,))
-    row = c.fetchone()
-    
-    if not row:
-        print(f"⚠️ Aviso: Cliente com número {from_number_user} não encontrado no banco de dados.")
+    if not from_number_user:
         return "OK", 200
 
-    status = row[0]
+    try:
+        response = supabase.table('WhatsAppContacts').select('id, status, name').eq('phone', from_number_user).limit(1).execute()
+        contact = response.data[0] if response.data else None
 
-    # ... O restante do seu fluxo de código (que já estava correto) ...
-    if status == "inicial":
-        if any(x in body for x in ["sim", "s", "yes"]):
-            enviar_whatsapp(
-                from_number_user,
-                f"Excelente, {profile_name}! 🙌\n\n"
-                "Segue em anexo o *Termo de Representação*.\n\n"
-                f"📄 Acesse aqui: {os.getenv('TERMO_URL')}\n\n"
-                "👉 Após preencher e assinar, envie a mensagem: *termo enviado*"
-            )
-            c.execute("UPDATE clientes SET status = ? WHERE numero = ?", ("aguardando_termo", from_number_user))
+        if not contact:
+            return "OK", 200 # Ignora mensagens de números não iniciados pelo sistema
 
-        elif any(x in body for x in ["não", "nao", "n", "no"]):
-            enviar_whatsapp(
-                from_number_user,
-                f"Entendido, {profile_name}! 👌\n\n"
-                "👉 Aceita receber propostas futuras? (SIM/NÃO)"
-            )
-            c.execute("UPDATE clientes SET status = ? WHERE numero = ?", ("oferta_futura", from_number_user))
+        contact_id = contact['id']
+        current_status = contact['status']
+        contact_name = contact.get('name') or profile_name
+        
+        print(f"ℹ️ Status do cliente {from_number_user} (ID: {contact_id}): {current_status}")
+
+        # Salva a mensagem recebida no histórico, agora incluindo o messageIdFromApi
+        message_data = {
+            "contactId": contact_id,
+            "sender": "user",
+            "text": original_body,
+            "timestamp": datetime.now().isoformat(),
+            "messageIdFromApi": message_sid # Adiciona o SID da mensagem aqui
+        }
+        supabase.table('WhatsAppMessages').insert(message_data).execute()
+
+        supabase.table('WhatsAppContacts').update({'lastMessage': original_body, 'lastTimestamp': datetime.now().isoformat(), 'unread': True}).eq('id', contact_id).execute()
+
+        # Handler universal para "atendente"
+        if "atendente" in body:
+            enviar_whatsapp(from_number_user, "Certo! Um de nossos especialistas entrará em contato em breve. Obrigado!")
+            supabase.table('WhatsAppContacts').update({"status": "Aguardando Vendedor", "automationStatus": "Pausada"}).eq('id', contact_id).execute()
+            return "OK", 200
+
+        # --- FLUXO DE CONVERSA PRINCIPAL ---
+        if current_status == "inicial":
+            if any(x in body for x in ["sim", "s", "yes", "quero"]):
+                termo_url = os.getenv('TERMO_URL', 'http://seusite.com/termo.docx')
+                mensagem_com_termo = (
+                    f"Excelente, {contact_name}! 🙌\n\n"
+                    "Para darmos andamento de forma organizada e transparente, estou enviando em anexo o Termo de Representação.\n\n"
+                    "Esse termo autoriza a Winston Serviços Corporativos a representar o(a) Sr.(a) na busca de propostas para o seu precatório.\n\n"
+                    "📌 *Importante:*\n"
+                    "• O documento não obriga a venda imediata;\n"
+                    "• Garante apenas que a Winston poderá negociar em seu nome, protegendo sua oportunidade;\n"
+                    "• Prevê uma remuneração de 6% para a Winston, paga somente em caso de efetiva venda.\n\n"
+                    f"📄 *Acesse o termo aqui:* {termo_url}\n\n"
+                    "Após o preenchimento, envie a palavra *preenchido* para prosseguirmos."
+                )
+                enviar_whatsapp(from_number_user, mensagem_com_termo)
+                supabase.table('WhatsAppContacts').update({"status": "aguardando_termo"}).eq('id', contact_id).execute()
+
+            elif any(x in body for x in ["não", "nao", "n", "no"]):
+                mensagem_oferta_futura = (
+                    f"Entendido, {contact_name}!\n\n"
+                    "Mesmo assim, gostaríamos de manter você informado(a) sobre oportunidades futuras que podem oferecer condições ainda melhores.\n\n"
+                    "Aceita que a Winston envie propostas futuras, caso surjam oportunidades vantajosas?\n\n"
+                    "Responda com *SIM* ou *NÃO*."
+                )
+                enviar_whatsapp(from_number_user, mensagem_oferta_futura)
+                supabase.table('WhatsAppContacts').update({"status": "oferta_futura"}).eq('id', contact_id).execute()
+            else:
+                 enviar_whatsapp(from_number_user, f"Olá {contact_name}, não entendi sua resposta. Por favor, responda com 'SIM' para prosseguir ou 'NÃO' para encerrar.")
+
+        elif current_status == "oferta_futura":
+            if any(x in body for x in ["sim", "s", "yes"]):
+                enviar_whatsapp(from_number_user, f"Confirmado, {contact_name}! Manteremos seu contato para futuras oportunidades.")
+                supabase.table('WhatsAppContacts').update({"status": "aguardando_oferta_futura", "automationStatus": "Pausada"}).eq('id', contact_id).execute()
             
-    # ... os outros fluxos permanecem iguais ...
-    
-    conn.commit()
-    conn.close()
+            elif any(x in body for x in ["não", "nao", "n", "no"]):
+                mensagem_final = (
+                    f"Entendido, {contact_name}.\n\n"
+                    "Respeitamos sua decisão. Caso mude de ideia, estaremos à disposição.\n\n"
+                    "Obrigado pela atenção!\n\n"
+                    "Winston Serviços Corporativos"
+                )
+                enviar_whatsapp(from_number_user, mensagem_final)
+                supabase.table('WhatsAppContacts').update({"status": "recusou_contato_futuro", "automationStatus": "Concluída"}).eq('id', contact_id).execute()
+
+        elif current_status == "aguardando_termo":
+            if "preenchido" in body:
+                mensagem_confirmacao = (
+                    f"Agradecemos a confiança, {contact_name}! 🙏\n\n"
+                    "A partir de agora, sua oportunidade será apresentada a bancos, fundos e investidores da nossa base qualificada.\n\n"
+                    "Assim que tivermos uma boa proposta concreta, entraremos em contato imediatamente para compartilhar os detalhes.\n\n"
+                    "Seguiremos juntos para viabilizar a melhor negociação possível.\n\n"
+                    "Atenciosamente, Winston Serviços Corporativos."
+                )
+                enviar_whatsapp(from_number_user, mensagem_confirmacao)
+                supabase.table('WhatsAppContacts').update({"status": "pos_termo", "termo_enviado_em": datetime.now().isoformat()}).eq('id', contact_id).execute()
+            else:
+                enviar_whatsapp(from_number_user, "Ainda estamos aguardando o preenchimento do termo. Assim que o fizer, por favor, envie a palavra *preenchido*.")
+
+    except Exception as e:
+        print(f"🔥 Erro crítico ao processar o webhook para {from_number_user}: {e}")
+
     return "OK", 200
 
 # ===============================
-# 🔹 Tarefa agendada: Follow-up
-# ===============================
-def follow_up_job():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT numero, nome, termo_enviado_em FROM clientes WHERE status = 'pos_termo' AND termo_enviado_em IS NOT NULL")
-    clientes = c.fetchall()
-
-    for numero, nome, termo_enviado_em in clientes:
-        dt_envio = datetime.strptime(termo_enviado_em, "%Y-%m-%d %H:%M:%S")
-        if datetime.now() >= dt_envio + timedelta(minutes=REMINDER_INTERVAL):
-            # 🛠️ Correção: O número do banco já tem o prefixo
-            enviar_whatsapp(
-                numero,
-                f"Olá {nome}, 👋\n\n"
-                "Estamos acompanhando sua oportunidade e queremos reforçar que seguimos em busca "
-                "da melhor proposta para seu precatório.\n\n"
-                "👉 Deseja continuar recebendo atualizações? (SIM/NÃO)"
-            )
-            c.execute("UPDATE clientes SET status = ? WHERE numero = ?", ("followup_enviado", numero))
-
-    conn.commit()
-    conn.close()
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(follow_up_job, "interval", minutes=1)
-scheduler.start()
-
-# ===============================
-# 🔹 Iniciar servidor Flask
+# 🔹 Iniciar servidor
 # ===============================
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    print("🚀 Servidor Flask (Bot WhatsApp) iniciando...")
+    app.run(port=5000, debug=True, use_reloader=False)
+
+
+
+
+# curl -X POST -H "Content-Type: application/json" \
+# -d '{"numero": "+5521969927793", "nome": "Cliente Teste"}' \
+# http://127.0.0.1:5000/api/disparar_template
