@@ -6,8 +6,6 @@ from dotenv import load_dotenv
 from datetime import datetime
 from flask_cors import CORS 
 
-
-
 # Carrega as variáveis de ambiente do arquivo .env
 load_dotenv()
 
@@ -86,56 +84,29 @@ def disparar_e_registrar_contato_inicial(numero, nome):
         return {"status": "erro", "mensagem": str(e)}
 
 # ===============================
-# 🔹 Endpoint para Disparo Inicial
+# 🔹 Endpoint para Disparo Inicial (Template)
 # ===============================
-
-# app.py
-
-# Adicione esta nova rota ao seu arquivo, pode ser depois do webhook.
-
-# ===============================
-# 🔹 Endpoint para Disparo em Lote
-# ===============================
-@app.route("/api/disparar_lote", methods=["POST"])
-def api_disparar_lote():
+# Nota: Esta rota não está definida no seu script. 
+# Se você a removeu, não tem problema, o frontend está chamando a de lote.
+# Vou adicionar uma aqui para garantir que não falte, caso precise no futuro.
+@app.route("/api/disparar_template", methods=["POST"])
+def api_disparar_template():
     data = request.json
-    contatos = data.get("contatos") # Espera uma lista de objetos: [{"numero": "...", "nome": "..."}, ...]
+    numero = data.get("numero")
+    nome = data.get("nome")
 
-    if not contatos or not isinstance(contatos, list):
-        return jsonify({"status": "erro", "mensagem": "A lista de 'contatos' é inválida ou ausente."}), 400
+    if not numero or not nome:
+        return jsonify({"status": "erro", "mensagem": "Número e nome são obrigatórios."}), 400
 
-    resultados = {
-        "sucessos": [],
-        "falhas": []
-    }
+    if not numero.startswith("whatsapp:"):
+        numero = "whatsapp:" + numero
+
+    resultado = disparar_e_registrar_contato_inicial(numero, nome)
     
-    # ATENÇÃO: Boa prática para listas grandes
-    # Para listas com centenas/milhares de contatos, este loop pode causar um timeout na requisição.
-    # A solução ideal seria usar uma fila de tarefas em background (como Celery ou RQ).
-    # Para começar, esta abordagem sequencial é suficiente.
-    
-    for contato in contatos:
-        numero = contato.get("numero")
-        nome = contato.get("nome", "Cliente")
-
-        if not numero:
-            resultados["falhas"].append({"contato": contato, "motivo": "Número ausente"})
-            continue
-        
-        # Garante o formato correto do número
-        if not numero.startswith("whatsapp:"):
-            numero = "whatsapp:" + numero
-
-        resultado_individual = disparar_e_registrar_contato_inicial(numero, nome)
-        
-        if resultado_individual["status"] == "sucesso":
-            resultados["sucessos"].append({"contato": contato, "sid": resultado_individual["sid"]})
-        else:
-            resultados["falhas"].append({"contato": contato, "motivo": resultado_individual["mensagem"]})
-
-    return jsonify(resultados)
-
-
+    if resultado["status"] == "sucesso":
+        return jsonify(resultado), 200
+    else:
+        return jsonify(resultado), 500
 
 # ===============================
 # 🔹 Webhook (respostas do cliente)
@@ -149,7 +120,7 @@ def webhook():
     profile_name = data.get("ProfileName", "Cliente")
     body = data.get("Body", "").strip().lower()
     original_body = data.get("Body", "").strip()
-    message_sid = data.get("MessageSid") # Captura o ID da mensagem da Twilio
+    message_sid = data.get("MessageSid")
 
     if not from_number_user:
         return "OK", 200
@@ -159,7 +130,7 @@ def webhook():
         contact = response.data[0] if response.data else None
 
         if not contact:
-            return "OK", 200 # Ignora mensagens de números não iniciados pelo sistema
+            return "OK", 200
 
         contact_id = contact['id']
         current_status = contact['status']
@@ -167,19 +138,16 @@ def webhook():
         
         print(f"ℹ️ Status do cliente {from_number_user} (ID: {contact_id}): {current_status}")
 
-        # Salva a mensagem recebida no histórico, agora incluindo o messageIdFromApi
         message_data = {
             "contactId": contact_id,
             "sender": "user",
             "text": original_body,
             "timestamp": datetime.now().isoformat(),
-            "messageIdFromApi": message_sid # Adiciona o SID da mensagem aqui
+            "messageIdFromApi": message_sid
         }
         supabase.table('WhatsAppMessages').insert(message_data).execute()
-
         supabase.table('WhatsAppContacts').update({'lastMessage': original_body, 'lastTimestamp': datetime.now().isoformat(), 'unread': True}).eq('id', contact_id).execute()
 
-        # Handler universal para "atendente"
         if "atendente" in body:
             enviar_whatsapp(from_number_user, "Certo! Um de nossos especialistas entrará em contato em breve. Obrigado!")
             supabase.table('WhatsAppContacts').update({"status": "Aguardando Vendedor", "automationStatus": "Pausada"}).eq('id', contact_id).execute()
@@ -202,7 +170,6 @@ def webhook():
                 )
                 enviar_whatsapp(from_number_user, mensagem_com_termo)
                 supabase.table('WhatsAppContacts').update({"status": "aguardando_termo"}).eq('id', contact_id).execute()
-
             elif any(x in body for x in ["não", "nao", "n", "no"]):
                 mensagem_oferta_futura = (
                     f"Entendido, {contact_name}!\n\n"
@@ -219,7 +186,6 @@ def webhook():
             if any(x in body for x in ["sim", "s", "yes"]):
                 enviar_whatsapp(from_number_user, f"Confirmado, {contact_name}! Manteremos seu contato para futuras oportunidades.")
                 supabase.table('WhatsAppContacts').update({"status": "aguardando_oferta_futura", "automationStatus": "Pausada"}).eq('id', contact_id).execute()
-            
             elif any(x in body for x in ["não", "nao", "n", "no"]):
                 mensagem_final = (
                     f"Entendido, {contact_name}.\n\n"
@@ -249,27 +215,18 @@ def webhook():
 
     return "OK", 200
 
-
 # ===============================
 # 🔹 Endpoint para Disparo em Lote
 # ===============================
 @app.route("/api/disparar_lote", methods=["POST"])
 def api_disparar_lote():
     data = request.json
-    contatos = data.get("contatos") # Espera uma lista de objetos: [{"numero": "...", "nome": "..."}, ...]
+    contatos = data.get("contatos")
 
     if not contatos or not isinstance(contatos, list):
         return jsonify({"status": "erro", "mensagem": "A lista de 'contatos' é inválida ou ausente."}), 400
 
-    resultados = {
-        "sucessos": [],
-        "falhas": []
-    }
-    
-    # ATENÇÃO: Boa prática para listas grandes
-    # Para listas com centenas/milhares de contatos, este loop pode causar um timeout na requisição.
-    # A solução ideal seria usar uma fila de tarefas em background (como Celery ou RQ).
-    # Para dezenas de contatos por vez, esta abordagem sequencial é suficiente para começar.
+    resultados = {"sucessos": [], "falhas": []}
     
     for contato in contatos:
         numero = contato.get("numero")
@@ -279,7 +236,6 @@ def api_disparar_lote():
             resultados["falhas"].append({"contato": contato, "motivo": "Número ausente"})
             continue
         
-        # Garante o formato correto do número
         if not numero.startswith("whatsapp:"):
             numero = "whatsapp:" + numero
 
@@ -292,16 +248,9 @@ def api_disparar_lote():
 
     return jsonify(resultados)
 
-
-
+# ===============================
 # 🔹 Iniciar servidor
 # ===============================
 if __name__ == "__main__":
     print("🚀 Servidor Flask (Bot WhatsApp) iniciando...")
     app.run(port=5000, debug=True, use_reloader=False)
-
-
-# curl -X POST -H "Content-Type: application/json" \
-#  -d '{"numero": "+5521969927793", "nome": "Cliente Teste"}' \
-#  https://chatbot-python-webhook.onrender.com/api/disparar_template
-
