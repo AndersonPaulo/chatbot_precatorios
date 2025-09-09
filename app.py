@@ -136,25 +136,6 @@ def api_disparar_lote():
     return jsonify(resultados)
 
 
-@app.route("/api/disparar_template", methods=["POST"])
-def api_disparar_template():
-    data = request.json
-    to_number = data.get("numero")
-    nome = data.get("nome", "Cliente")
-
-    if not to_number:
-        return jsonify({"status": "erro", "mensagem": "Número de telefone ausente."}), 400
-
-    # Garante que o número está no formato correto para a Twilio
-    if not to_number.startswith("whatsapp:"):
-        to_number = "whatsapp:" + to_number
-    
-    resultado = disparar_e_registrar_contato_inicial(to_number, nome)
-    
-    if resultado["status"] == "sucesso":
-        return jsonify(resultado)
-    else:
-        return jsonify(resultado), 500
 
 # ===============================
 # 🔹 Webhook (respostas do cliente)
